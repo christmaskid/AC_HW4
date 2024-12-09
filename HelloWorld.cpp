@@ -9,6 +9,8 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/BitVector.h" // set operation
 #include "llvm/ADT/DenseMap.h" // mapping expression to bitvector position
+#include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/PostOrderIterator.h"
 #include <map> // DenseMap is hard to use...
 
 using namespace llvm;
@@ -129,6 +131,46 @@ struct BasicBlockInfo {
 
 };
 
+void initBasicBlockInfoBitVector(BasicBlockInfo* b, unsigned n) {
+	b->Exprs.resize(n);
+	b->Exprs.reset();
+	b->ExprKill.resize(n);
+	b->ExprKill.reset();
+	b->DEExpr.resize(n);
+	b->DEExpr.reset();
+	b->UEExpr.resize(n);
+	b->UEExpr.reset();
+
+	b->AvailOut.resize(n);
+	b->AvailOut.reset();
+	b->AvailIn.resize(n);
+	b->AvailIn.reset();
+	b->AntOut.resize(n);
+	b->AntOut.reset();
+	b->AntIn.resize(n);
+	b->AntIn.reset();
+}
+
+void printBasicBlockInfo(BasicBlockInfo* bbinfo) {
+	errs() << "> Block:\t";
+	errs() << *(bbinfo->B);
+	errs() << "ExprKill:\t";
+	print_bitvector(bbinfo->ExprKill);
+	errs() << "DEExpr:\t\t";
+	print_bitvector(bbinfo->DEExpr);
+	errs() << "UEExpr:\t\t";
+	print_bitvector(bbinfo->UEExpr);
+
+	errs() << "AvailOut:\t";
+	print_bitvector(bbinfo->AvailOut);
+	errs() << "AvailIn:\t";
+	print_bitvector(bbinfo->AvailIn);
+	errs() << "AntOut:\t\t";
+	print_bitvector(bbinfo->AntOut);
+	errs() << "AntIn:\t\t";
+	print_bitvector(bbinfo->AntIn);
+}
+
 template <typename Iterator>
 void scanBlockAndMark(BitVector &target, int set_value, \
 	Iterator b_begin, Iterator b_end,\
@@ -174,23 +216,12 @@ void scanBlockAndMark(BitVector &target, int set_value, \
 }
 void setExpr(BasicBlockInfo* bbinfo, std::map<Expression, unsigned int> exprmap) {
 	int n = exprmap.size();
-	errs() << "Set Expr: n = " << n << "\n";
-	errs() << *(bbinfo->B) << "\n";
-
-	bbinfo->ExprKill.resize(n);
-	bbinfo->ExprKill.reset();
-	bbinfo->DEExpr.resize(n);
-	bbinfo->DEExpr.reset();
-	bbinfo->UEExpr.resize(n);
-	bbinfo->UEExpr.reset();
-
+	// BitVectors shall be initialized
 
 	// ExprKill: = Definition
 	for(int i=0;i<n;i++) {
 		bbinfo->ExprKill[i] = bbinfo->Exprs[i];
 	}
-	errs() << "\nExprKill ";
-	print_bitvector(bbinfo->ExprKill);
 
 	// DEExpr:
 	// the expression is evaluated AFTER (re)definition within the same block, 
@@ -208,14 +239,10 @@ void setExpr(BasicBlockInfo* bbinfo, std::map<Expression, unsigned int> exprmap)
 	*/
 	scanBlockAndMark(bbinfo->DEExpr, 1, bbinfo->B->begin(), bbinfo->B->end(), exprmap);
 	scanBlockAndMark(bbinfo->DEExpr, 0, bbinfo->B->rbegin(), bbinfo->B->rend(), exprmap);
-	errs() << "DEExpr: ";
-	print_bitvector(bbinfo->DEExpr);
 
 	// UEExpr: reverse
 	scanBlockAndMark(bbinfo->UEExpr, 1, bbinfo->B->rbegin(), bbinfo->B->rend(), exprmap);
 	scanBlockAndMark(bbinfo->UEExpr, 0, bbinfo->B->begin(), bbinfo->B->end(), exprmap);
-	errs() << "UEExpr: ";
-	print_bitvector(bbinfo->UEExpr);
 }
 
 
@@ -225,20 +252,161 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 	unsigned int exprmap_n = 0;
 	std::map<Expression, unsigned int> exprmap;
 	SmallVector<Expression, 128> inv_exprmap;
-	std::map<unsigned, BasicBlockInfo> blockmap;
+	std::map<BasicBlock*, BasicBlockInfo> blockmap;
 
-	void init() {
+	SmallVector<BasicBlock*, 16> RRPOlist;
+
+	void buildRRPOiter(BasicBlock* B, SmallVector<BasicBlock*, 16> &worklist, \
+		std::map <BasicBlock*, bool> &visited) {
+
+		errs() << "iter to ";
+		B->printAsOperand(errs(), false);
+		errs() << "\n";
+
+		if (!succ_empty(B)) {
+			errs() << "succs: add ";
+			for(BasicBlock* succ : successors(B)) {
+
+				B->printAsOperand(errs(), false);
+				errs() << " -> ";
+				succ->printAsOperand(errs(), false);
+				errs() << ": " << visited[succ] << "\n";
+
+				if (!visited[succ]) {
+					visited[succ] = true;
+					buildRRPOiter(succ, worklist, visited);
+				}
+			}
+		}
+		worklist.push_back(B);
+	}
+
+	void buildReversedReversePostOrderList(Function* F, SmallVector<BasicBlock*, 16> &worklist) {
+		std::map <BasicBlock*, bool> visited;
+		visited.clear();
+		for(auto &B : *F) {
+			visited[&B] = false;
+		}
+
+		BasicBlock* entryBlock = &(F->getEntryBlock());
+		visited[entryBlock] = true;
+		buildRRPOiter(entryBlock, worklist, visited);
+	}
+	void init(Function *F) {
 		exprmap_n = 0;
 		exprmap.clear();
 		inv_exprmap.clear();
 		// blocks.clear();
 		blockmap.clear();
+		RRPOlist.clear();
+
+		buildReversedReversePostOrderList(F, RRPOlist);
+	}
+
+	// forward flow problem
+	void buildAvailExpr(Function* F) {
+		errs() << "Reverse postorder traversal on "<<F->getName()<<"\n";
+		BasicBlock* entryBlock = &(F->getEntryBlock());
+		for(auto B : ReversePostOrderTraversal<BasicBlock*>(entryBlock)) {
+			B->printAsOperand(errs(), false);
+			errs() << " ";
+
+			BitVector negExprkill = blockmap[B].ExprKill;
+			negExprkill.flip();
+			// blockmap[B].AvailOut = blockmap[B].DEExpr | (blockmap[B].AvailIn & negExprkill);
+			blockmap[B].AvailOut = blockmap[B].AvailIn;
+			blockmap[B].AvailOut &= negExprkill;
+			blockmap[B].AvailOut |= blockmap[B].DEExpr;
+
+			blockmap[B].AvailIn.reset();
+			if (!pred_empty(B)) {
+				blockmap[B].AvailIn.flip();
+				for(BasicBlock *pred : predecessors(B)) {
+					blockmap[B].AvailIn &= blockmap[pred].AvailOut;
+				}
+			}
+		}
+		errs() << "\n";
+	}
+
+	// backward flow problem
+	void buildAnticiExpr(Function* F) {
+		// skip external functions
+		if (F->isDeclaration())
+			return;
+
+		if (F->empty()) {
+			errs() << "No entry block found.\n";
+			return;
+		}
+		errs() << "Reverse postorder traversal on reversed "<<F->getName()<<"\n";
+
+		BasicBlock* entryBlock = &(F->getEntryBlock());
+		for(auto B : RRPOlist) {
+			B->printAsOperand(errs(), false);
+			errs() << " ";
+
+			BitVector negExprkill = blockmap[B].ExprKill;
+			negExprkill.flip();
+			// blockmap[B].AntIn = blockmap[B].UEExpr | (blockmap[B].AntOut & negExprkill);
+			blockmap[B].AntIn = blockmap[B].AntOut;
+			blockmap[B].AntIn &= negExprkill;
+			blockmap[B].AntIn |= blockmap[B].UEExpr;
+
+			blockmap[B].AntOut.reset();
+			if (!succ_empty(B)) {
+				blockmap[B].AntOut.flip(); // initialize with all expressions
+				for(BasicBlock *succ: successors(B)) {
+					blockmap[B].AntOut &= blockmap[succ].AntIn;
+				}
+			}
+		}
+		errs() << "\n";
+
+		// SmallVector<BasicBlock*, 16> worklist;
+		// std::map<BasicBlock*, bool> visited;
+
+		// for(auto &B : *F) {
+		// 	visited.insert(std::make_pair(&B, false));
+		// 	// traversal starts from leaves
+		// 	if (succ_empty(&B)) {
+		// 		worklist.push_back(&B);
+		// 		blockmap[&B].AntOut.reset();
+		// 		visited[&B] = true;
+		// 	}
+		// }
+		// while(!worklist.empty()) {
+		// 	BasicBlock* B = worklist.pop_back_val(); // we use a stack structure for postorder trasversal
+		// 	B->printAsOperand(errs(), false);
+		// 	errs() << " ";
+
+		// 	BitVector negExprkill = blockmap[B].ExprKill;
+		// 	negExprkill.flip();
+		// 	// blockmap[B].AntIn = blockmap[B].UEExpr | (blockmap[B].AntOut & negExprkill);
+		// 	blockmap[B].AntIn = blockmap[B].AntOut;
+		// 	blockmap[B].AntIn &= negExprkill;
+		// 	blockmap[B].AntIn |= blockmap[B].UEExpr;
+
+		// 	blockmap[B].AntOut.reset();
+		// 	if (!succ_empty(B)) {
+		// 		blockmap[B].AntOut.flip(); // initialize with all expressions
+		// 		for(BasicBlock *succ: successors(B)) {
+		// 			blockmap[B].AntOut &= blockmap[succ].AntIn;
+		// 		}
+		// 	}
+
+		// 	for(BasicBlock *pred : predecessors(B)) {
+		// 		if (!visited[pred]) {
+		// 			worklist.push_back(pred);
+		// 			visited[pred] = true;
+		// 		}
+		// 	}
+		// }
+		errs() << "\n";
 	}
 
 	void buildInfos(Function &F) {
-
 		// first pass: build CFG and collect global expressions
-		int i = 0;
 	    for (auto &B : F) {
 	    	errs() << "> basic block " << B << "\n";
 			BasicBlockInfo bbinfo;
@@ -253,33 +421,29 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 	    			inv_exprmap.push_back(expr);
 	    		}
 	    	}
-	    	blockmap.insert(std::make_pair(i++, bbinfo));
+	    	blockmap.insert(std::make_pair(&B, bbinfo));
 
 	    }
 	    errs() << "N = " << exprmap_n << "\n";
 
 	    // second pass: build bitvectors
-	    int n_block = i;
-	    for (int i=0; i<n_block; i++) {
-	    	// errs() << "Check:" << *(blockmap[i].B) << ", i=" << i << "\n";
-
-	    	blockmap[i].Exprs.resize(exprmap_n);
-	    	blockmap[i].Exprs.reset();
-
-	    	for (auto &expr : blockmap[i].exprs) {	
+	    for(auto &B : F) {
+	    	initBasicBlockInfoBitVector(&(blockmap[&B]), exprmap_n);
+	    	for (auto &expr : blockmap[&B].exprs) {	
 	    		unsigned idx = exprmap[expr];
-	    		blockmap[i].Exprs[idx]=1;
-
-	    		// errs() << idx << ": " << *(expr.I) << "\n";
+	    		blockmap[&B].Exprs[idx]=1;
 	    	}
-	    	print_bitvector(blockmap[i].Exprs);
+	    	print_bitvector(blockmap[&B].Exprs);
 	    }
 
-	    for (int i=0; i<n_block; i++) {
-	    	errs() << blockmap[i].Exprs.size() << "\n";
-	    	setExpr(&(blockmap[i]), exprmap);
-	    }
+	    for(auto &B : F)
+	    	setExpr(&(blockmap[&B]), exprmap);
+	    buildAvailExpr(&F);
+	    buildAnticiExpr(&F);
 
+	    for(auto &B : F) {
+	    	printBasicBlockInfo(&(blockmap[&B]));
+	    }
 	}
 
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
@@ -287,7 +451,13 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
         for (auto &F : M) {
         	errs() << F.getName() << " " << F.size() << "\n";
 
-        	init();
+			if (F.isDeclaration()) // exclude external functions
+				continue;
+			if (F.empty()) {
+				errs() << "No entry block found.\n";
+				continue;
+			}
+        	init(&F);
         	buildInfos(F);
         }
         return PreservedAnalyses::all();
