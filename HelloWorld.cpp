@@ -1,3 +1,7 @@
+// This project is greatly aided by ChatGPT for LLVM syntax usage. 
+// You can see the process here at this link: 
+// https://chatgpt.com/share/67585d68-91e4-8003-b8bc-14576da175ad
+
 #include "llvm/Pass.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
@@ -12,6 +16,8 @@
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include <map> // DenseMap is hard to use...
+
+typedef std::pair<llvm::BasicBlock*, llvm::BasicBlock*> BBpair;
 
 using namespace llvm;
 
@@ -28,7 +34,7 @@ void print_bitvector(BitVector bv) {
 	for(int i=0;i<n;i++) {
 		errs() << bv[i];
 	}
-	errs() << "\n";
+	errs() <<" ("<<n<< ")\n";
 }
 
 struct Expression {
@@ -110,6 +116,7 @@ Expression InstrToExpr(Instruction* I) {
 struct BasicBlockInfo {
 	BasicBlock* B;
 	SmallVector<Expression> exprs;
+	std::map<unsigned, Expression*> idx2expr;
 	// preds: for(BasicBlock *pred : predecessors(&B))
 	// succs: for(BasicBlock *succ : successors(&B))
 
@@ -121,6 +128,10 @@ struct BasicBlockInfo {
 	BitVector AvailIn;
 	BitVector AntOut;
 	BitVector AntIn;
+
+	BitVector LaterIn;
+	BitVector Delete;
+
 
 	bool operator==(const BasicBlockInfo &x) const {
 		return (B == x.B);
@@ -149,6 +160,11 @@ void initBasicBlockInfoBitVector(BasicBlockInfo* b, unsigned n) {
 	b->AntOut.reset();
 	b->AntIn.resize(n);
 	b->AntIn.reset();
+
+	b->LaterIn.resize(n);
+	b->LaterIn.reset();
+	b->Delete.resize(n);
+	b->Delete.reset();
 }
 
 void printBasicBlockInfo(BasicBlockInfo* bbinfo) {
@@ -169,6 +185,11 @@ void printBasicBlockInfo(BasicBlockInfo* bbinfo) {
 	print_bitvector(bbinfo->AntOut);
 	errs() << "AntIn:\t\t";
 	print_bitvector(bbinfo->AntIn);
+
+	errs() << "LaterIn:\t";
+	print_bitvector(bbinfo->LaterIn);
+	errs() << "Delete:\t\t";
+	print_bitvector(bbinfo->Delete);
 }
 
 template <typename Iterator>
@@ -214,7 +235,7 @@ void scanBlockAndMark(BitVector &target, int set_value, \
 		}
 	}
 }
-void setExpr(BasicBlockInfo* bbinfo, std::map<Expression, unsigned int> exprmap) {
+void buildExprKill(BasicBlockInfo* bbinfo, std::map<Expression, unsigned int> exprmap) {
 	int n = exprmap.size();
 	// BitVectors shall be initialized
 
@@ -246,31 +267,84 @@ void setExpr(BasicBlockInfo* bbinfo, std::map<Expression, unsigned int> exprmap)
 }
 
 
+void print_edges(SmallVector<BBpair, 8> edges) {
+	for(auto &pair : edges) {
+		errs() << "(";
+		pair.first->printAsOperand(errs(), false);
+		errs() << ",";
+		pair.second->printAsOperand(errs(), false);
+		errs() << ") ";
+	}
+	errs() << "\n";
+}
+
+struct EdgeInfo {
+	BBpair edge;
+	BasicBlock* start;
+	BasicBlock* end;
+
+	BitVector Earliest;
+	BitVector Later;
+	BitVector Insert;
+
+	BasicBlock* InsertBlock;
+
+	bool operator==(const EdgeInfo &x) const {
+		return (edge == x.edge);
+	}
+	bool operator<(const EdgeInfo &x) const {
+		return (edge < x.edge);
+	}
+};
+void initEdgeInfoBitVector(EdgeInfo* edgeinfo, BBpair pair, unsigned n) {
+	edgeinfo->start = pair.first;
+	edgeinfo->end = pair.second;
+
+	edgeinfo->Earliest.resize(n);
+	edgeinfo->Earliest.reset();
+
+	edgeinfo->Later.resize(n);
+	edgeinfo->Later.reset();
+	edgeinfo->Insert.resize(n);
+	edgeinfo->Insert.reset();
+
+	edgeinfo->InsertBlock = NULL;
+}
+
+void printEdgeInfo(EdgeInfo* edgeinfo) {
+	errs() << "(";
+	edgeinfo->edge.first->printAsOperand(errs(), false);
+	errs() << ",";
+	edgeinfo->edge.second->printAsOperand(errs(), false);
+	errs() << ")\n";
+
+	errs() << "Earliest:\t";
+	print_bitvector(edgeinfo->Earliest);
+	errs() << "Later:\t\t";
+	print_bitvector(edgeinfo->Later);
+	errs() << "\n";
+}
+
 struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 
-	// SmallVector<BasicBlockInfo, 8> blocks;
+	// Expression related stuff
 	unsigned int exprmap_n = 0;
 	std::map<Expression, unsigned int> exprmap;
 	SmallVector<Expression, 128> inv_exprmap;
-	std::map<BasicBlock*, BasicBlockInfo> blockmap;
 
+	// CFG related stuff
+	std::map<BasicBlock*, BasicBlockInfo> blockmap;
+	SmallVector<BBpair, 8> edges;
+	std::map<BBpair*, EdgeInfo> edgemap;
 	SmallVector<BasicBlock*, 16> RRPOlist;
 
 	void buildRRPOiter(BasicBlock* B, SmallVector<BasicBlock*, 16> &worklist, \
 		std::map <BasicBlock*, bool> &visited) {
 
-		errs() << "iter to ";
-		B->printAsOperand(errs(), false);
-		errs() << "\n";
-
 		if (!succ_empty(B)) {
-			errs() << "succs: add ";
 			for(BasicBlock* succ : successors(B)) {
-
-				B->printAsOperand(errs(), false);
-				errs() << " -> ";
-				succ->printAsOperand(errs(), false);
-				errs() << ": " << visited[succ] << "\n";
+				// build edges at the same time
+				edges.push_back(std::make_pair(B, succ));
 
 				if (!visited[succ]) {
 					visited[succ] = true;
@@ -281,7 +355,7 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 		worklist.push_back(B);
 	}
 
-	void buildReversedReversePostOrderList(Function* F, SmallVector<BasicBlock*, 16> &worklist) {
+	void buildTraversalInfo(Function* F, SmallVector<BasicBlock*, 16> &worklist) {
 		std::map <BasicBlock*, bool> visited;
 		visited.clear();
 		for(auto &B : *F) {
@@ -292,6 +366,7 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 		visited[entryBlock] = true;
 		buildRRPOiter(entryBlock, worklist, visited);
 	}
+
 	void init(Function *F) {
 		exprmap_n = 0;
 		exprmap.clear();
@@ -300,7 +375,7 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 		blockmap.clear();
 		RRPOlist.clear();
 
-		buildReversedReversePostOrderList(F, RRPOlist);
+		buildTraversalInfo(F, RRPOlist);
 	}
 
 	// forward flow problem
@@ -362,47 +437,74 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 			}
 		}
 		errs() << "\n";
+	}
 
-		// SmallVector<BasicBlock*, 16> worklist;
-		// std::map<BasicBlock*, bool> visited;
 
-		// for(auto &B : *F) {
-		// 	visited.insert(std::make_pair(&B, false));
-		// 	// traversal starts from leaves
-		// 	if (succ_empty(&B)) {
-		// 		worklist.push_back(&B);
-		// 		blockmap[&B].AntOut.reset();
-		// 		visited[&B] = true;
-		// 	}
-		// }
-		// while(!worklist.empty()) {
-		// 	BasicBlock* B = worklist.pop_back_val(); // we use a stack structure for postorder trasversal
-		// 	B->printAsOperand(errs(), false);
-		// 	errs() << " ";
+	void buildEarliest() {
+		for (auto &edge : edges) {
+			EdgeInfo* edgeinfo = &(edgemap[&edge]);
+			BasicBlock* i = edgeinfo->start;
+			BasicBlock* j = edgeinfo->end;
 
-		// 	BitVector negExprkill = blockmap[B].ExprKill;
-		// 	negExprkill.flip();
-		// 	// blockmap[B].AntIn = blockmap[B].UEExpr | (blockmap[B].AntOut & negExprkill);
-		// 	blockmap[B].AntIn = blockmap[B].AntOut;
-		// 	blockmap[B].AntIn &= negExprkill;
-		// 	blockmap[B].AntIn |= blockmap[B].UEExpr;
+			BitVector negAvailOut_i = blockmap[i].AvailOut;
+			negAvailOut_i.flip();
+			BitVector negAntOut_i = blockmap[i].AntOut;
+			negAntOut_i.flip();
+			
+			// Earliest(i,j) = AntIn(j) & !(AvailOut(i)) & (ExprKill(i) + !AntOut(i))
+			edgeinfo->Earliest |= blockmap[i].ExprKill;
+			edgeinfo->Earliest |= negAntOut_i;
+			edgeinfo->Earliest &= blockmap[i].AntIn;
+			edgeinfo->Earliest &= negAvailOut_i;
+		}
+	}
 
-		// 	blockmap[B].AntOut.reset();
-		// 	if (!succ_empty(B)) {
-		// 		blockmap[B].AntOut.flip(); // initialize with all expressions
-		// 		for(BasicBlock *succ: successors(B)) {
-		// 			blockmap[B].AntOut &= blockmap[succ].AntIn;
-		// 		}
-		// 	}
+	// Forward flow
+	void buildLater(Function &F) {
+		BasicBlock* entryBlock = &(F.getEntryBlock());
+		for(auto B : ReversePostOrderTraversal<BasicBlock*>(entryBlock)) {
+			if (pred_empty(B)) continue;
 
-		// 	for(BasicBlock *pred : predecessors(B)) {
-		// 		if (!visited[pred]) {
-		// 			worklist.push_back(pred);
-		// 			visited[pred] = true;
-		// 		}
-		// 	}
-		// }
-		errs() << "\n";
+			blockmap[B].LaterIn.reset();
+			blockmap[B].LaterIn.flip();
+
+			for(BasicBlock* pred : predecessors(B)) {
+				BBpair pair = std::make_pair(B, pred);
+				EdgeInfo* edgeinfo = &(edgemap[&pair]);
+				BasicBlockInfo* bbinfo = &(blockmap[B]);
+				
+				// Later(i,j) = Earliest(i,j) + (LaterIn(i) & UEExpr(i)) for i in pred(j)
+				edgeinfo->Later = bbinfo->LaterIn;
+				edgeinfo->Later &= bbinfo->UEExpr;
+				edgeinfo->Later |= edgeinfo->Earliest;
+
+				bbinfo->LaterIn &= edgeinfo->Later;
+
+			}
+		}
+	}
+
+	void buildInsertDelete(Function &F) {
+		for(auto &edge: edges) {
+			EdgeInfo* edgeinfo = &(edgemap[&edge]);
+			// Insert(i,j) = Later(i,j) & !(LaterIn(j))
+			edgeinfo->Insert.reset();
+			edgeinfo->Insert |= edgeinfo->Later;
+			BitVector negLaterIn_j = blockmap[edgeinfo->end].LaterIn;
+			negLaterIn_j.flip();
+			edgeinfo->Insert &= negLaterIn_j;
+
+			// Delete(i) = UEExpr(i) & !(LaterIn(i))
+			BasicBlock* i = edgeinfo->start;
+			blockmap[i].Delete.reset();
+			if (i != &(F.getEntryBlock())) {
+				blockmap[i].Delete.reset();
+				blockmap[i].Delete |= blockmap[i].UEExpr;
+				BitVector negLaterIn_i = blockmap[i].LaterIn;
+				negLaterIn_i.flip();
+				blockmap[i].Delete &= negLaterIn_i;
+			}
+		}
 	}
 
 	void buildInfos(Function &F) {
@@ -429,27 +531,96 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 	    // second pass: build bitvectors
 	    for(auto &B : F) {
 	    	initBasicBlockInfoBitVector(&(blockmap[&B]), exprmap_n);
+
 	    	for (auto &expr : blockmap[&B].exprs) {	
 	    		unsigned idx = exprmap[expr];
 	    		blockmap[&B].Exprs[idx]=1;
+	    		blockmap[&B].idx2expr[idx] = &expr;
 	    	}
-	    	print_bitvector(blockmap[&B].Exprs);
+	    	// print_bitvector(blockmap[&B].Exprs);
 	    }
 
 	    for(auto &B : F)
-	    	setExpr(&(blockmap[&B]), exprmap);
+	    	buildExprKill(&(blockmap[&B]), exprmap);
 	    buildAvailExpr(&F);
 	    buildAnticiExpr(&F);
+
+	    // Edges
+		for(auto &edge : edges) {
+			EdgeInfo edgeinfo;
+			edgeinfo.edge = edge;
+			initEdgeInfoBitVector(&edgeinfo, edge, exprmap_n);
+			edgemap[&edge] = edgeinfo;
+		}
+	    buildEarliest();
+	    buildLater(F);
+
+	    // Code motion
+	    buildInsertDelete(F);
 
 	    for(auto &B : F) {
 	    	printBasicBlockInfo(&(blockmap[&B]));
 	    }
+		for(auto &edge : edges) {
+			printEdgeInfo(&(edgemap[&edge]));
+		}
+	}
+
+	void rewriteInsert(Function* F) {
+		for(auto &edge : edges) {
+			EdgeInfo* edgeinfo = &(edgemap[&edge]);
+			BasicBlock* i = edgeinfo->start;
+			BasicBlock* j = edgeinfo->end;
+
+			IRBuilder<> builder_i(i);
+
+			for(int idx = 0; idx < exprmap_n; idx++) {
+				if (!edgeinfo->Insert[idx]) continue;
+				Expression* expr = &(inv_exprmap[idx]);
+				Instruction* cloned_instr = expr->I->clone();
+
+				if (succ_size(i)==1) {
+					// insert the expression at the end of block i
+					cloned_instr->insertInto(i, i->end());
+				}
+				else if(pred_size(j)==1) {
+					// insert the expression at the entry of block j
+					cloned_instr->insertBefore(i->begin());
+				}
+				else {
+					// split the edge (i,j) by creating a new block in between
+					LLVMContext &Context = F->getContext();
+					BasicBlock* newBlock = BasicBlock::Create(Context, "new_block", F);
+
+					i->getTerminator()->replaceUsesOfWith(j, newBlock);
+					BranchInst::Create(j, newBlock);
+					cloned_instr->insertBefore(newBlock->begin());
+				}
+			}
+		}
+	}
+	void rewriteDelete(Function* F) {
+		for(auto &B : *F) {
+			BasicBlockInfo* bbinfo = &(blockmap[&B]);
+			for(int idx=0; idx<exprmap_n; idx++) {
+				if (!bbinfo->Delete[idx]) continue;
+				Instruction* I = bbinfo->idx2expr[idx]->I;
+				// remove the expression
+				I->eraseFromParent();
+			}
+		}
+	}
+
+	void codeMotion(Function* F) {
+		rewriteInsert(F);
+		rewriteDelete(F);
 	}
 
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
     	errs() << "Hello from run()!\n"; // Check if the pass is called
         for (auto &F : M) {
         	errs() << F.getName() << " " << F.size() << "\n";
+        	errs() << F << "\n";
 
 			if (F.isDeclaration()) // exclude external functions
 				continue;
@@ -459,6 +630,8 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 			}
         	init(&F);
         	buildInfos(F);
+        	codeMotion(&F);
+        	errs() << "After: " << F.getName() << " " << F << "\n";
         }
         return PreservedAnalyses::all();
     }
