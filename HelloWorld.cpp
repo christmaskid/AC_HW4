@@ -91,22 +91,18 @@ Expression InstrToExpr(Instruction* I) {
 	expr.opcode = I->getOpcode();
 
 	if (isa<StoreInst>(*I)) {
-		expr.dest = I->op_begin()+1;
-		for(auto iter = I->op_begin(); iter != I->op_end(); ++iter) {
-			if (iter == I->op_begin()+1)
-				continue;
-
-			Value* op = *iter;
-			expr.operands.push_back(op);
-		}
+		expr.dest = I->getOperand(1);
 	}
 	else {
 		expr.dest = I; // the destination value is the instruction itself
-		// https://stackoverflow.com/questions/44946645/traversal-of-llvm-operands
-		for(auto iter = I->op_begin(); iter != I->op_end(); ++iter) {
-			Value* op = *iter;
-			expr.operands.push_back(op);
-		}
+	}
+
+	// https://stackoverflow.com/questions/44946645/traversal-of-llvm-operands
+	for (unsigned i = 0; i < I->getNumOperands(); ++i) {
+		if (isa<StoreInst>(*I) && i == 1) continue; // Skip the destination operand
+		
+		Value* op = I->getOperand(i);
+		expr.operands.push_back(op);
 	}
 
 	// errs() << expr.dest << " = " << " " << I->getOpcodeName() << " ";
@@ -115,7 +111,8 @@ Expression InstrToExpr(Instruction* I) {
 
 
 bool ignore_instr(Instruction* I) {
-	return (isa<AllocaInst>(*I));
+	return (isa<AllocaInst>(*I) || I->isTerminator() || isa<CallInst>(*I));
+	// terminator: branch, return
 }
 
 
@@ -160,6 +157,7 @@ void initBasicBlockInfoBitVector(BasicBlockInfo* b, unsigned n) {
 
 	b->AvailOut.resize(n);
 	b->AvailOut.reset();
+
 	b->AvailIn.resize(n);
 	b->AvailIn.reset();
 	b->AntOut.resize(n);
@@ -228,13 +226,7 @@ void scanBlockAndMark(BitVector &target, int set_value, \
 		// errs() << "defined:"; print_bitvector(defined);
 
 		if (check_operand) {
-			for(auto &op: I.operands()) {
-				// Expression op_expr = InstrToExpr(dyn_cast<Instruction>(op)); // wrong!!
-				// auto it = exprmap.find(op_expr);
-				// if (it == exprmap.end())
-				// 	continue;
-				// unsigned bit = it->second;
-
+			for(auto &op: I_expr.operands) {
 				unsigned bit = -1;
 				for(auto& it : exprmap) {
 					Expression expr_ = it.first;
@@ -258,7 +250,8 @@ void buildExprKill(BasicBlockInfo* bbinfo, std::map<Expression, unsigned int> ex
 		unsigned bit = exprmap[*expr_];
 		Instruction* I = expr_->I;
 
-		for(auto &op: I->operands()) {
+		for(auto &op: expr_->operands) {
+
 			int n = exprmap.size();
 			for(int i=0; i<n; i++) {
 				if (!bbinfo->Exprs[i]) continue;
@@ -415,25 +408,53 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 	// forward flow problem
 	void buildAvailExpr(Function* F) {
 		errs() << "Reverse postorder traversal on "<<F->getName()<<"\n";
+
 		BasicBlock* entryBlock = &(F->getEntryBlock());
+
+		// Initialization
 		for(auto B : ReversePostOrderTraversal<BasicBlock*>(entryBlock)) {
+			blockmap[B].AvailOut.reset();
+			blockmap[B].AvailOut.flip();
+			blockmap[B].AvailIn.reset();
+		}
+		blockmap[entryBlock].AvailIn.reset();
+
+		for(auto B : ReversePostOrderTraversal<BasicBlock*>(entryBlock)) {
+
 			B->printAsOperand(errs(), false);
-			errs() << " ";
+			
+			if (!pred_empty(B)) {
+				errs() << *B << "\n";
+				errs() << "AvailIn "; print_bitvector(blockmap[B].AvailIn); errs()<<"\n";
+				
+				int flag = 0;
+				for(BasicBlock *pred : predecessors(B)) {
+					if (flag)
+						blockmap[B].AvailIn &= blockmap[pred].AvailOut;
+					else
+						blockmap[B].AvailIn |= blockmap[pred].AvailOut;
+					flag = 1;
+
+					errs()<<"& "; pred->printAsOperand(errs(), false); print_bitvector(blockmap[pred].AvailOut); errs()<<"\n";
+					errs()<<"= ";print_bitvector(blockmap[B].AvailIn); errs()<<"\n";
+				}
+			}
 
 			BitVector negExprkill = blockmap[B].ExprKill;
 			negExprkill.flip();
 			// blockmap[B].AvailOut = blockmap[B].DEExpr | (blockmap[B].AvailIn & negExprkill);
-			blockmap[B].AvailOut = blockmap[B].AvailIn;
+			blockmap[B].AvailOut.reset();
+			blockmap[B].AvailOut |= blockmap[B].AvailIn;
 			blockmap[B].AvailOut &= negExprkill;
 			blockmap[B].AvailOut |= blockmap[B].DEExpr;
 
-			blockmap[B].AvailIn.reset();
-			if (!pred_empty(B)) {
-				blockmap[B].AvailIn.flip();
-				for(BasicBlock *pred : predecessors(B)) {
-					blockmap[B].AvailIn &= blockmap[pred].AvailOut;
-				}
-			}
+			B->printAsOperand(errs(), false);
+			errs() << " AvailOut\n";
+			errs() << "AvailIn: "; print_bitvector(blockmap[B].AvailIn); errs()<<"\n";
+			errs() << "& !(ExprKill): ";print_bitvector(negExprkill); errs()<<"\n";
+			errs() << "+ DEExpr: "; print_bitvector(blockmap[B].DEExpr); errs()<<"\n";
+			errs() << "= ";print_bitvector(blockmap[B].AvailOut); errs()<<"\n";
+
 		}
 		errs() << "\n";
 	}
@@ -451,24 +472,38 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 		errs() << "Reverse postorder traversal on reversed "<<F->getName()<<"\n";
 
 		BasicBlock* entryBlock = &(F->getEntryBlock());
+
+		// Initialization
+		for(auto B : RRPOlist) {
+			blockmap[B].AntOut.reset();
+			blockmap[B].AntIn.reset();
+			blockmap[B].AntIn.flip(); // initialize with all expressions
+		}
+
 		for(auto B : RRPOlist) {
 			B->printAsOperand(errs(), false);
 			errs() << " ";
 
+			blockmap[B].AntOut.reset();
+			if (!succ_empty(B)) {
+				int flag = 0;
+				for(BasicBlock *succ: successors(B)) {
+					if (flag)
+						blockmap[B].AntOut &= blockmap[succ].AntIn;
+					else
+						blockmap[B].AntOut |= blockmap[succ].AntIn;
+					flag = 1;
+				}
+			}
+
 			BitVector negExprkill = blockmap[B].ExprKill;
 			negExprkill.flip();
 			// blockmap[B].AntIn = blockmap[B].UEExpr | (blockmap[B].AntOut & negExprkill);
-			blockmap[B].AntIn = blockmap[B].AntOut;
+			blockmap[B].AntIn.reset();
+			blockmap[B].AntIn |= blockmap[B].AntOut;
 			blockmap[B].AntIn &= negExprkill;
 			blockmap[B].AntIn |= blockmap[B].UEExpr;
 
-			blockmap[B].AntOut.reset();
-			if (!succ_empty(B)) {
-				blockmap[B].AntOut.flip(); // initialize with all expressions
-				for(BasicBlock *succ: successors(B)) {
-					blockmap[B].AntOut &= blockmap[succ].AntIn;
-				}
-			}
 		}
 		errs() << "\n";
 	}
@@ -599,17 +634,17 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 	    // Code motion
 	    buildInsertDelete(F);
 
-	    for(int i=0; i<exprmap_n; i++) {
-	    	errs() << i << ": " << *(inv_exprmap[i].I) << ", DEST:";
-	    	inv_exprmap[i].dest->printAsOperand(errs(), false);
-	    	errs() << ", OP:";
-	    	for(auto &op: inv_exprmap[i].I->operands()) {
-	    		errs() << " ";
-	    		op->printAsOperand(errs(), false);
-	    	}
-	    	errs() << "\n";
-	    }
-	    errs() << "\n";
+	    // for(int i=0; i<exprmap_n; i++) {
+	    // 	errs() << i << ": " << *(inv_exprmap[i].I) << ", DEST:";
+	    // 	inv_exprmap[i].dest->printAsOperand(errs(), false);
+	    // 	errs() << ", OP:";
+	    // 	for(auto &op: inv_exprmap[i].operands) {
+	    // 		errs() << " ";
+	    // 		op->printAsOperand(errs(), false);
+	    // 	}
+	    // 	errs() << "\n";
+	    // }
+	    // errs() << "\n";
 
 	    for(auto &B : F) {
 	    	printBasicBlockInfo(&(blockmap[&B]));
