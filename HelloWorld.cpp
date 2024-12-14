@@ -33,6 +33,8 @@ void print_bitvector(BitVector bv) {
 	int n = bv.size();
 	for(int i=0;i<n;i++) {
 		errs() << bv[i];
+		if (!((i+1)%10))
+			errs() << " ";
 	}
 	errs() <<" ("<<n<< ")\n";
 }
@@ -86,30 +88,34 @@ Expression InstrToExpr(Instruction* I) {
 	// errs() << *I << "\n";
 	Expression expr;
 	expr.I = I;
-	expr.dest = I; // the destination valu is the instruction itself
 	expr.opcode = I->getOpcode();
 
-	// errs() << expr.dest << " = " << " " << I->getOpcodeName() << " ";
+	if (isa<StoreInst>(*I)) {
+		expr.dest = I->op_begin()+1;
+		for(auto iter = I->op_begin(); iter != I->op_end(); ++iter) {
+			if (iter == I->op_begin()+1)
+				continue;
 
-	// https://stackoverflow.com/questions/44946645/traversal-of-llvm-operands
-	for(auto iter = I->op_begin(); iter != I->op_end(); ++iter) {
-		Value* op = *iter;
-		expr.operands.push_back(op);
-		// errs() << "operand:";
-		// print_value(*op);
-		// errs() << " ";
+			Value* op = *iter;
+			expr.operands.push_back(op);
+		}
 	}
-	// errs() << "\n";
+	else {
+		expr.dest = I; // the destination value is the instruction itself
+		// https://stackoverflow.com/questions/44946645/traversal-of-llvm-operands
+		for(auto iter = I->op_begin(); iter != I->op_end(); ++iter) {
+			Value* op = *iter;
+			expr.operands.push_back(op);
+		}
+	}
 
-	// for(auto iter = I->user_begin(); iter != I->user_end(); ++iter) {
-		// Value* user = *iter;
-		// errs() << "user:";
-		// print_value(*user);
-		// errs() << " ";
-	// }
-	// errs() << "\n";
-
+	// errs() << expr.dest << " = " << " " << I->getOpcodeName() << " ";
 	return expr;
+}
+
+
+bool ignore_instr(Instruction* I) {
+	return (isa<AllocaInst>(*I));
 }
 
 
@@ -195,7 +201,7 @@ void printBasicBlockInfo(BasicBlockInfo* bbinfo) {
 template <typename Iterator>
 void scanBlockAndMark(BitVector &target, int set_value, \
 	Iterator b_begin, Iterator b_end,\
-	std::map<Expression, unsigned int> exprmap) {
+	std::map<Expression, unsigned int> exprmap, int check_operand) {
 
 	int n = exprmap.size();
 	// errs() << n << "\n";
@@ -206,50 +212,73 @@ void scanBlockAndMark(BitVector &target, int set_value, \
 	for(auto it = b_begin; it != b_end; it++) {
 		Instruction &I = *it;
 		// errs() << I << "\n";
+		if (ignore_instr(&I))
+			continue;
 
 		Expression I_expr = InstrToExpr(&I);
 		if (exprmap.find(I_expr) != exprmap.end()) {
 			unsigned bit = exprmap[I_expr];
 			// errs() << bit << "\n";
 			defined[bit] = 1;
+
+			if (!check_operand) {
+				target[bit] = set_value;
+			}
 		}
 		// errs() << "defined:"; print_bitvector(defined);
 
-		for(auto &op: I.operands()) {
-			// Expression op_expr = InstrToExpr(dyn_cast<Instruction>(op)); // wrong!!
-			// auto it = exprmap.find(op_expr);
-			// if (it == exprmap.end())
-			// 	continue;
-			// unsigned bit = it->second;
+		if (check_operand) {
+			for(auto &op: I.operands()) {
+				// Expression op_expr = InstrToExpr(dyn_cast<Instruction>(op)); // wrong!!
+				// auto it = exprmap.find(op_expr);
+				// if (it == exprmap.end())
+				// 	continue;
+				// unsigned bit = it->second;
 
-			unsigned bit = -1;
-			for(auto& it : exprmap) {
-				Expression expr_ = it.first;
-				if (expr_.dest == op) {
-					bit = exprmap[expr_];
-					break;
+				unsigned bit = -1;
+				for(auto& it : exprmap) {
+					Expression expr_ = it.first;
+					if (expr_.dest == op) {
+						bit = exprmap[expr_];
+						break;
+					}
 				}
+				if (bit!=-1 && defined[bit])
+					target[bit] = set_value;
 			}
-			if (bit!=-1 && defined[bit])
-				target[bit] = set_value;
 		}
 	}
 }
-void buildExprKill(BasicBlockInfo* bbinfo, std::map<Expression, unsigned int> exprmap) {
-	int n = exprmap.size();
-	// BitVectors shall be initialized
+void buildExprKill(BasicBlockInfo* bbinfo, std::map<Expression, unsigned int> exprmap, \
+	SmallVector<Expression, 128> inv_exprmap) {
 
-	// ExprKill: = Definition
-	for(int i=0;i<n;i++) {
-		bbinfo->ExprKill[i] = bbinfo->Exprs[i];
+	bbinfo->ExprKill.reset();
+	for(auto &pair : exprmap) {
+		const Expression* expr_ = &(pair.first);
+		unsigned bit = exprmap[*expr_];
+		Instruction* I = expr_->I;
+
+		for(auto &op: I->operands()) {
+			int n = exprmap.size();
+			for(int i=0; i<n; i++) {
+				if (!bbinfo->Exprs[i]) continue;
+				Expression* def_expr = &(inv_exprmap[i]);
+				if (def_expr->dest == op) {
+					bbinfo->ExprKill[bit] = 1;
+					break;
+				}
+			}
+		}
 	}
+}
 
+void buildDEExpr(BasicBlockInfo* bbinfo, std::map<Expression, unsigned int> exprmap) {
 	// DEExpr:
 	// the expression is evaluated AFTER (re)definition within the same block, 
 	// and its operands are not redefined afterwards
 
 	/* 	For each instruction:
-			record that this expr is defined (eg. %1 = %2 + %3 --> defined[%1]=1)s
+			record that this expr is defined (eg. %1 = %2 + %3 --> defined[%1]=1)
 			for each operand : instruction
 				if operand has been defined: mark as YES // evaluated
 
@@ -258,12 +287,17 @@ void buildExprKill(BasicBlockInfo* bbinfo, std::map<Expression, unsigned int> ex
 			for each operand : instruction
 				if operand has been defined: mark as NO
 	*/
-	scanBlockAndMark(bbinfo->DEExpr, 1, bbinfo->B->begin(), bbinfo->B->end(), exprmap);
-	scanBlockAndMark(bbinfo->DEExpr, 0, bbinfo->B->rbegin(), bbinfo->B->rend(), exprmap);
-
+	bbinfo->DEExpr.reset();
+	// bbinfo->DEExpr.flip();
+	scanBlockAndMark(bbinfo->DEExpr, 1, bbinfo->B->begin(), bbinfo->B->end(), exprmap, 0);
+	scanBlockAndMark(bbinfo->DEExpr, 0, bbinfo->B->rbegin(), bbinfo->B->rend(), exprmap, 1);
+}
+void buildUEExpr(BasicBlockInfo* bbinfo, std::map<Expression, unsigned int> exprmap) {
 	// UEExpr: reverse
-	scanBlockAndMark(bbinfo->UEExpr, 1, bbinfo->B->rbegin(), bbinfo->B->rend(), exprmap);
-	scanBlockAndMark(bbinfo->UEExpr, 0, bbinfo->B->begin(), bbinfo->B->end(), exprmap);
+	bbinfo->UEExpr.reset();
+	// bbinfo->UEExpr.flip();
+	scanBlockAndMark(bbinfo->UEExpr, 1, bbinfo->B->rbegin(), bbinfo->B->rend(), exprmap, 0);
+	scanBlockAndMark(bbinfo->UEExpr, 0, bbinfo->B->begin(), bbinfo->B->end(), exprmap, 1);
 }
 
 
@@ -516,6 +550,10 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 
 	    	for (auto &I : B) {
 	    		Expression expr = InstrToExpr(&I);
+
+	    		if (ignore_instr(&I))
+	    			continue;
+
 	    		bbinfo.exprs.push_back(expr);
 
 	    		if (exprmap.find(expr) == exprmap.end()) {
@@ -540,8 +578,11 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 	    	// print_bitvector(blockmap[&B].Exprs);
 	    }
 
-	    for(auto &B : F)
-	    	buildExprKill(&(blockmap[&B]), exprmap);
+	    for(auto &B : F) {
+	    	buildExprKill(&(blockmap[&B]), exprmap, inv_exprmap);
+	    	buildDEExpr(&(blockmap[&B]), exprmap);
+	    	buildUEExpr(&(blockmap[&B]), exprmap);
+	    }
 	    buildAvailExpr(&F);
 	    buildAnticiExpr(&F);
 
@@ -557,6 +598,18 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 
 	    // Code motion
 	    buildInsertDelete(F);
+
+	    for(int i=0; i<exprmap_n; i++) {
+	    	errs() << i << ": " << *(inv_exprmap[i].I) << ", DEST:";
+	    	inv_exprmap[i].dest->printAsOperand(errs(), false);
+	    	errs() << ", OP:";
+	    	for(auto &op: inv_exprmap[i].I->operands()) {
+	    		errs() << " ";
+	    		op->printAsOperand(errs(), false);
+	    	}
+	    	errs() << "\n";
+	    }
+	    errs() << "\n";
 
 	    for(auto &B : F) {
 	    	printBasicBlockInfo(&(blockmap[&B]));
