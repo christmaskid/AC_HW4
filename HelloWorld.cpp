@@ -227,51 +227,6 @@ void scanBlockAndMark(BitVector &target, int set_value, \
 		}
 	}
 }
-void buildExprKill(BasicBlockInfo* bbinfo, std::map<Expression, unsigned int> exprmap, \
-	SmallVector<Expression, 128> inv_exprmap) {
-
-	bbinfo->ExprKill.reset();
-	for(auto &pair : exprmap) {
-		const Expression* expr_ = &(pair.first);
-		unsigned bit = exprmap[*expr_];
-		Instruction* I = expr_->I;
-
-		for(auto &op: expr_->operands) {
-
-			int n = exprmap.size();
-			for(int i=0; i<n; i++) {
-				if (!bbinfo->Exprs[i]) continue;
-				Expression* def_expr = &(inv_exprmap[i]);
-				if (def_expr->dest == op) {
-					bbinfo->ExprKill[bit] = 1;
-					break;
-				}
-			}
-		}
-	}
-}
-
-void buildDEExpr(BasicBlockInfo* bbinfo, std::map<Expression, unsigned int> exprmap) {
-	errs() << "buildDEExpr\n";
-	// DEExpr:
-	// the expression is evaluated AFTER (re)definition within the same block, 
-	// and its operands are not redefined afterwards
-
-	/* 	For each instruction:
-			record that this expr is defined (eg. %1 = %2 + %3 --> defined[%1]=1)
-			for each operand : instruction
-				if operand has been defined: mark as No
-	*/
-	bbinfo->DEExpr.reset();
-	bbinfo->DEExpr |= bbinfo->Exprs;
-	scanBlockAndMark(bbinfo->DEExpr, 0, bbinfo->B->begin(), bbinfo->B->end(), exprmap);
-}
-void buildUEExpr(BasicBlockInfo* bbinfo, std::map<Expression, unsigned int> exprmap) {
-	// UEExpr: reverse
-	bbinfo->UEExpr.reset();
-	bbinfo->UEExpr |= bbinfo->Exprs;
-	scanBlockAndMark(bbinfo->UEExpr, 0, bbinfo->B->rbegin(), bbinfo->B->rend(), exprmap);
-}
 
 
 void print_edges(SmallVector<BBpair, 8> edges) {
@@ -382,6 +337,42 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 		buildTraversalInfo(F, RRPOlist);
 	}
 
+	void buildExprKill(BasicBlockInfo* bbinfo) {
+
+		bbinfo->ExprKill.reset();
+		for(auto &pair : exprmap) {
+			const Expression* expr_ = &(pair.first);
+			unsigned bit = exprmap[*expr_];
+			Instruction* I = expr_->I;
+
+			for(auto &op: expr_->operands) {
+
+				int n = exprmap.size();
+				for(int i=0; i<n; i++) {
+					if (!bbinfo->Exprs[i]) continue;
+					Expression* def_expr = &(inv_exprmap[i]);
+					if (def_expr->dest == op) {
+						bbinfo->ExprKill[bit] = 1;
+						break;
+					}
+				}
+			}
+		}
+	}
+	void buildDEExpr(BasicBlockInfo* bbinfo) {
+		// DEExpr:
+		// the expression is evaluated AFTER (re)definition within the same block, 
+		// and its operands are not redefined afterwards
+		bbinfo->DEExpr.reset();
+		bbinfo->DEExpr |= bbinfo->Exprs;
+		scanBlockAndMark(bbinfo->DEExpr, 0, bbinfo->B->begin(), bbinfo->B->end(), exprmap);
+	}
+	void buildUEExpr(BasicBlockInfo* bbinfo) {
+		// UEExpr: reverse
+		bbinfo->UEExpr.reset();
+		bbinfo->UEExpr |= bbinfo->Exprs;
+		scanBlockAndMark(bbinfo->UEExpr, 0, bbinfo->B->rbegin(), bbinfo->B->rend(), exprmap);
+	}
 	// forward flow problem
 	void buildAvailExpr(Function* F) {
 		errs() << "Reverse postorder traversal on "<<F->getName()<<"\n";
@@ -401,8 +392,8 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 			B->printAsOperand(errs(), false);
 			
 			if (!pred_empty(B)) {
-				errs() << *B << "\n";
-				errs() << "AvailIn "; print_bitvector(blockmap[B].AvailIn); errs()<<"\n";
+				// errs() << *B << "\n";
+				// errs() << "AvailIn "; print_bitvector(blockmap[B].AvailIn); errs()<<"\n";
 
 				int flag = 0;
 				for(BasicBlock *pred : predecessors(B)) {
@@ -412,8 +403,8 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 						blockmap[B].AvailIn |= blockmap[pred].AvailOut;
 					flag = 1;
 
-					errs()<<"& "; pred->printAsOperand(errs(), false); print_bitvector(blockmap[pred].AvailOut); errs()<<"\n";
-					errs()<<"= ";print_bitvector(blockmap[B].AvailIn); errs()<<"\n";
+					// errs()<<"& "; pred->printAsOperand(errs(), false); print_bitvector(blockmap[pred].AvailOut); errs()<<"\n";
+					// errs()<<"= ";print_bitvector(blockmap[B].AvailIn); errs()<<"\n";
 				}
 			}
 
@@ -424,13 +415,6 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 			blockmap[B].AvailOut |= blockmap[B].AvailIn;
 			blockmap[B].AvailOut &= negExprkill;
 			blockmap[B].AvailOut |= blockmap[B].DEExpr;
-
-			B->printAsOperand(errs(), false);
-			errs() << " AvailOut\n";
-			errs() << "AvailIn: "; print_bitvector(blockmap[B].AvailIn); errs()<<"\n";
-			errs() << "& !(ExprKill): ";print_bitvector(negExprkill); errs()<<"\n";
-			errs() << "+ DEExpr: "; print_bitvector(blockmap[B].DEExpr); errs()<<"\n";
-			errs() << "= ";print_bitvector(blockmap[B].AvailOut); errs()<<"\n";
 
 		}
 		errs() << "\n";
@@ -498,19 +482,19 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 			negAntOut_i.flip();
 			
 			// Earliest(i,j) = AntIn(j) & !(AvailOut(i)) & (ExprKill(i) + !AntOut(i))
-			errs() << "buildEarliest "<<edgeinfo<<"\n";
-			printEdgeInfo(edgeinfo);
+			// errs() << "buildEarliest "<<edgeinfo<<"\n";
+			// printEdgeInfo(edgeinfo);
 			edgeinfo->Earliest.reset();
-			errs() << "Build earliest "; print_bitvector(edgeinfo->Earliest); errs()<<"\n"; 
+			// errs() << "Build earliest "; print_bitvector(edgeinfo->Earliest); errs()<<"\n"; 
 			edgeinfo->Earliest |= blockmap[i].ExprKill;
-			errs() << "= ExprKill "; print_bitvector(blockmap[i].ExprKill); errs()<<"\n";
+			// errs() << "= ExprKill "; print_bitvector(blockmap[i].ExprKill); errs()<<"\n";
 			edgeinfo->Earliest |= negAntOut_i;
-			errs() << "+ !AntOut(i) "; print_bitvector(negAntOut_i); errs()<<"\n";
+			// errs() << "+ !AntOut(i) "; print_bitvector(negAntOut_i); errs()<<"\n";
 			edgeinfo->Earliest &= blockmap[j].AntIn;
-			errs() << "&  AntIn(j)"; print_bitvector(blockmap[j].AntIn); errs()<<"\n";
+			// errs() << "&  AntIn(j)"; print_bitvector(blockmap[j].AntIn); errs()<<"\n";
 			edgeinfo->Earliest &= negAvailOut_i;
-			errs() << "&  !AvailOut(i)"; print_bitvector(negAvailOut_i); errs()<<"\n";
-			errs() << "= "; print_bitvector(edgeinfo->Earliest); errs()<<"\n"; 
+			// errs() << "&  !AvailOut(i)"; print_bitvector(negAvailOut_i); errs()<<"\n";
+			// errs() << "= "; print_bitvector(edgeinfo->Earliest); errs()<<"\n"; 
 		}
 	}
 
@@ -518,39 +502,40 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 	void buildLater(Function &F) {
 		BasicBlock* entryBlock = &(F.getEntryBlock());
 		for(auto B : ReversePostOrderTraversal<BasicBlock*>(entryBlock)) {
-			errs()<<"buildLater "<<B->getName()<<" "<<pred_size(B)<<" "<<pred_empty(B)<<"\n";
+			// errs()<<"buildLater "<<B->getName()<<" "<<pred_size(B)<<" "<<pred_empty(B)<<"\n";
 
 			blockmap[B].LaterIn.reset();
-			if (pred_empty(B)) continue;
-			blockmap[B].LaterIn.flip();
+			if (!pred_empty(B)) {
+				blockmap[B].LaterIn.flip();
 
-			for(BasicBlock* pred : predecessors(B)) {
-				BBpair pair = std::make_pair(pred, B);
-				EdgeInfo* edgeinfo = &(edgemap[pair]);
-				BasicBlockInfo* bbinfo_i = &(blockmap[pred]);
-				BasicBlockInfo* bbinfo_j = &(blockmap[B]);
+				for(BasicBlock* pred : predecessors(B)) {
+					BBpair pair = std::make_pair(pred, B);
+					EdgeInfo* edgeinfo = &(edgemap[pair]);
+					BasicBlockInfo* bbinfo_i = &(blockmap[pred]);
+					BasicBlockInfo* bbinfo_j = &(blockmap[B]);
 
-				errs() << "Edge between\n";
-				printBasicBlockInfo(bbinfo_i);
-				errs() << "\nand\n";
-				printBasicBlockInfo(bbinfo_j);
+					bbinfo_j->LaterIn &= edgeinfo->Later;
 
-				errs() << "For edge " <<edgeinfo<<" "<< (edgemap.find(pair) == edgemap.end())<<"\n";
-				printEdgeInfo(edgeinfo);
-				
-				// Later(i,j) = Earliest(i,j) + (LaterIn(i) & UEExpr(i)) for i in pred(j)
-				edgeinfo->Later.reset();
-				errs() << "Build Later "; print_bitvector(edgeinfo->Later); errs()<<"\n"; 
-				edgeinfo->Later |= bbinfo_i->LaterIn;
-				errs() << "= LaterIn "; print_bitvector(bbinfo_i->LaterIn); errs()<<"\n";
-				edgeinfo->Later &= bbinfo_i->UEExpr;
-				errs() << "& UEExpr(i) "; print_bitvector(bbinfo_i->UEExpr); errs()<<"\n";
-				edgeinfo->Later |= edgeinfo->Earliest;
-				errs() << "| Earliest(i,j) "; print_bitvector(edgeinfo->Earliest); errs()<<"\n";
-				errs() << "= "; print_bitvector(edgeinfo->Later); errs()<<"\n"; 
-
-				bbinfo_j->LaterIn &= edgeinfo->Later;
-
+				}
+			}
+			if (!succ_empty(B)) {
+				for(BasicBlock* succ : successors(B)) {
+					BBpair pair = std::make_pair(B, succ);
+					EdgeInfo* edgeinfo = &(edgemap[pair]);
+					BasicBlockInfo* bbinfo_i = &(blockmap[B]);
+					BasicBlockInfo* bbinfo_j = &(blockmap[succ]);
+					
+					// Later(i,j) = Earliest(i,j) + (LaterIn(i) & UEExpr(i)) for i in pred(j)
+					edgeinfo->Later.reset();
+					// errs() << "Build Later "; print_bitvector(edgeinfo->Later); errs()<<"\n"; 
+					edgeinfo->Later |= bbinfo_i->LaterIn;
+					// errs() << "= LaterIn "; print_bitvector(bbinfo_i->LaterIn); errs()<<"\n";
+					edgeinfo->Later &= bbinfo_i->UEExpr;
+					// errs() << "& UEExpr(i) "; print_bitvector(bbinfo_i->UEExpr); errs()<<"\n";
+					edgeinfo->Later |= edgeinfo->Earliest;
+					// errs() << "| Earliest(i,j) "; print_bitvector(edgeinfo->Earliest); errs()<<"\n";
+					// errs() << "= "; print_bitvector(edgeinfo->Later); errs()<<"\n"; 
+				}
 			}
 		}
 	}
@@ -578,21 +563,11 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 		}
 	}
 
-	void buildEdges(Function &F) {
-	    for (auto &B : F) {
-	    	if (succ_empty(&B)) continue;
 
-			for(BasicBlock* succ : successors(&B))
-				edges.push_back(std::make_pair(&B, succ));
-	    }
-	    errs() << "buildEdges\n";
-	    print_edges(edges);
-	}
-
-	void buildInfos(Function &F) {
+	void buildNodes(Function &F) {
 		// first pass: build CFG and collect global expressions
 	    for (auto &B : F) {
-	    	errs() << "> basic block " << B << "\n";
+	    	// errs() << "> basic block " << B << "\n";
 			BasicBlockInfo bbinfo;
 	    	bbinfo.B = &B;
 
@@ -611,7 +586,7 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 	    	}
 	    	blockmap.insert(std::make_pair(&B, bbinfo));
 	    }
-	    errs() << "N = " << exprmap_n << "\n";
+	    // errs() << "N = " << exprmap_n << "\n";
 
 	    // second pass: build bitvectors
 	    for(auto &B : F) {
@@ -624,27 +599,42 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 	    	}
 	    	// print_bitvector(blockmap[&B].Exprs);
 	    }
+	}
 
-	    // third pass: build edges
-	    buildEdges(F);
+	void buildEdges(Function &F) {
+	    for (auto &B : F) {
+	    	if (succ_empty(&B)) continue;
 
-	    // Finally: let's build LCM related variables!
-
-	    for(auto &B : F) {
-	    	buildExprKill(&(blockmap[&B]), exprmap, inv_exprmap);
-	    	buildDEExpr(&(blockmap[&B]), exprmap);
-	    	buildUEExpr(&(blockmap[&B]), exprmap);
+			for(BasicBlock* succ : successors(&B))
+				edges.push_back(std::make_pair(&B, succ));
 	    }
-	    buildAvailExpr(&F);
-	    buildAnticiExpr(&F);
-
-	    // Edges
+	    // errs() << "buildEdges\n";
+	    // print_edges(edges);
 		for(auto &edge : edges) {
 			EdgeInfo edgeinfo;
 			edgeinfo.edge = edge;
 			initEdgeInfoBitVector(&edgeinfo, edge, exprmap_n);
 			edgemap[edge] = edgeinfo;
 		}
+	}
+
+	void buildInfos(Function &F) {
+		// Collect CFG info
+		buildNodes(F);
+	    buildEdges(F); // must be after nodes
+
+	    // Finally: let's build LCM related variables!
+
+	    // Nodes
+	    for(auto &B : F) {
+	    	buildExprKill(&(blockmap[&B]));
+	    	buildDEExpr(&(blockmap[&B]));
+	    	buildUEExpr(&(blockmap[&B]));
+	    }
+	    buildAvailExpr(&F);
+	    buildAnticiExpr(&F);
+
+	    // Edges
 	    buildEarliest();
 	    buildLater(F);
 
@@ -670,9 +660,18 @@ struct HelloWorldPass : public PassInfoMixin<HelloWorldPass> {
 			for(int idx = 0; idx < exprmap_n; idx++) {
 				if (!edgeinfo->Insert[idx]) continue;
 				Expression* expr = &(inv_exprmap[idx]);
-				Instruction* cloned_instr = expr->I->clone();
+				Instruction* cloned_instr = expr->I;//->clone();
 
-				errs() << "Insert " << *cloned_instr << "\n";
+
+				// Ref. Cornell course, LLVM for grad: addtomul example
+    			// Everywhere the old instruction was used as an operand,
+    			// use our new instruction instead.
+    			for (auto& U : expr->I->uses()) {
+    				User* user = U.getUser(); // A User is anything with operands
+    				user->setOperand(U.getOperandNo(), cloned_instr);
+    			}
+
+				errs() << "Insert " << *cloned_instr << " from " << *(expr->I) << "\n";
 
 				if (succ_size(i)==1) {
 					errs() << "insert the expression at the end of block i\n";
